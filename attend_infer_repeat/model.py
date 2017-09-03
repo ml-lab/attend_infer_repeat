@@ -18,8 +18,9 @@ class AIRModel(object):
                  explore_eps=None, debug=False):
         """Creates the model.
 
-        :param obs: tf.Tensor, imags
-        :param nums: tf.Tensor, number of digits in images (not used for inference or training)
+        :param obs: tf.Tensor, images
+        :param nums: tf.Tensor, number of objects in images
+            Note: it is not used for inference or training; could be removed from here.
         :param max_steps: int, maximum number of steps to take (or objects in the image)
         :param glimpse_size: tuple of ints, size of the attention glimpse
         :param n_appearance: int, number of latent variables describing an object
@@ -126,12 +127,9 @@ class AIRModel(object):
                 posterior = Normal(self.what_loc, self.what_scale)
 
                 what_kl = _kl(posterior, prior)
-                what_kl = tf.reduce_sum(what_kl, -1, keep_dims=True) * self.presence
+                what_kl = tf.reduce_sum(what_kl, -1, keep_dims=True)
                 appearance_prior_loss_per_sample = tf.squeeze(tf.reduce_sum(what_kl, 0))
 
-                #         n_samples_with_encoding = tf.reduce_sum(tf.to_float(tf.greater(num_step_per_sample, 0.)))
-                #         div = tf.maximum(n_samples_with_encoding, 1.)
-                #         appearance_prior_loss = tf.reduce_sum(latent_code_prior_loss_per_sample) / div
                 self.appearance_prior_loss = tf.reduce_mean(appearance_prior_loss_per_sample)
                 tf.summary.scalar('latent_code_prior', self.appearance_prior_loss)
                 prior_loss.add(self.appearance_prior_loss, appearance_prior_loss_per_sample)
@@ -156,7 +154,7 @@ class AIRModel(object):
                 shift_prior = Normal(shift_mean, where_shift_prior.scale)
 
                 shift_kl = _kl(shift_distrib, shift_prior)
-                where_kl = tf.reduce_sum(scale_kl + shift_kl, -1, keep_dims=True) * self.presence
+                where_kl = tf.reduce_sum(scale_kl + shift_kl, -1, keep_dims=True)
                 where_kl_per_sample = tf.reduce_sum(tf.squeeze(where_kl), 0)
                 self.where_kl = tf.reduce_mean(where_kl_per_sample)
                 tf.summary.scalar('where_prior', self.where_kl)
@@ -168,12 +166,14 @@ class AIRModel(object):
         """Implements REINFORCE for training the discrete probability distribution over number of steps and train-step
          for the baseline"""
 
-        if baseline is None:
-            baseline = getattr(self, 'baseline', None)
+        if baseline is not None:
+            self.baseline = baseline
 
-        if callable(baseline):
-            baseline_module = baseline
-            self.baseline = baseline(self.obs, self.what, self.where, self.presence_prob)
+        if not isinstance(self.baseline, tf.Tensor):
+            self.baseline_module = self.baseline
+            self.baseline = self.baseline_module(self.obs, self.what, self.where, self.presence_prob)
+            self.baseline_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
+                                                   scope=self.baseline_module.variable_scope.name)
 
         log_prob = self.num_steps_distrib.log_prob(self.num_step_per_sample)
         log_prob = tf.clip_by_value(log_prob, -1e38, 1e38)
@@ -186,21 +186,15 @@ class AIRModel(object):
         reinforce_loss_per_sample = tf.stop_gradient(self.importance_weight) * log_prob
         self.reinforce_loss = tf.reduce_mean(reinforce_loss_per_sample)
         tf.summary.scalar('reinforce_loss', self.reinforce_loss)
+        return self.reinforce_loss
 
-        # Baseline Optimisation
-        baseline_vars, baseline_train_step = [], None
-        if baseline is not None:
-            baseline_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
-                                              scope=baseline_module.variable_scope.name)
-            baseline_target = tf.stop_gradient(loss.per_sample)
-            baseline_loss_per_sample = (baseline_target - self.baseline) ** 2
-            self.baseline_loss = tf.reduce_mean(baseline_loss_per_sample)
-            tf.summary.scalar('baseline_loss', self.baseline_loss)
-
-            baseline_opt = make_opt(10 * self.learning_rate)
-            baseline_train_step = baseline_opt.minimize(self.baseline_loss, var_list=baseline_vars)
-
-        return self.reinforce_loss, baseline_vars, baseline_train_step
+    def _make_baseline_train_step(self, opt, loss, baseline, baseline_vars):
+        baseline_target = tf.stop_gradient(loss.per_sample)
+        baseline_loss_per_sample = (baseline_target - baseline) ** 2
+        self.baseline_loss = tf.reduce_mean(baseline_loss_per_sample)
+        tf.summary.scalar('baseline_loss', self.baseline_loss)
+        train_step = opt.minimize(self.baseline_loss, var_list=baseline_vars)
+        return train_step
 
     def train_step(self, learning_rate, l2_weight=0., appearance_prior=None, where_scale_prior=None,
                    where_shift_prior=None,
@@ -263,14 +257,11 @@ class AIRModel(object):
 
             # REINFORCE
             opt_loss = loss.value
-            baseline_vars = []
             if use_reinforce:
-                reinforce_loss, baseline_vars, baseline_train_step = self._reinforce(loss, make_opt, baseline)
-                if baseline_train_step is not None:
-                    self._train_step.append(baseline_train_step)
-
+                reinforce_loss = self._reinforce(loss, make_opt, baseline)
                 opt_loss += reinforce_loss
 
+            baseline_vars = getattr(self, 'baseline_vars', [])
             model_vars = list(set(tf.trainable_variables()) - set(baseline_vars))
             # L2 reg
             if l2_weight > 0.:
@@ -282,8 +273,12 @@ class AIRModel(object):
 
             opt = make_opt(self.learning_rate)
             gvs = opt.compute_gradients(opt_loss, var_list=model_vars)
-            true_train_step = opt.apply_gradients(gvs, global_step=global_step)
-            self._train_step.append(true_train_step)
+            self._train_step = opt.apply_gradients(gvs, global_step=global_step)
+            if self.baseline is not None:
+                baseline_opt = make_opt(10 * learning_rate)
+                with tf.control_dependencies([self._train_step]):
+                    self._train_step = self._make_baseline_train_step(baseline_opt, loss,
+                                                                      self.baseline, self.baseline_vars)
 
             # Metrics
             gradient_summaries(gvs)

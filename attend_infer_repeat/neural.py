@@ -6,7 +6,7 @@ import sonnet as snt
 
 def create_linear_initializer(input_size):
     """Returns a default initializer for weights of a linear module."""
-    stddev = 1. / math.sqrt(input_size * 2)
+    stddev = 1. / math.sqrt(input_size * 3)
     return tf.truncated_normal_initializer(stddev=stddev)
 
 
@@ -19,6 +19,7 @@ def selu(x):
 
 default_activation = tf.nn.elu
 
+# default_init = None
 default_init = {
     'w': create_linear_initializer,
     'b': tf.zeros_initializer()

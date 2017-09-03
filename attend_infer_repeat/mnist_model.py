@@ -1,3 +1,6 @@
+from functools import partial
+
+import tensorflow as tf
 import sonnet as snt
 
 from model import AIRModel
@@ -19,10 +22,14 @@ class AIRonMNIST(AIRModel):
                  *args, **kwargs):
 
         self.baseline = BaselineMLP(baseline_hidden)
+        self.transform_var_bias = tf.Variable(transform_var_bias, trainable=False, dtype=tf.float32, name='transform_var_bias')
+        self.step_bias = tf.Variable(step_bias, trainable=False, dtype=tf.float32, name='step_bias')
 
-        def _make_transform_estimator(x):
-            est = StochasticTransformParam(transform_estimator_hidden, x, scale_bias=transform_var_bias)
-            return est
+        transform_estimator = partial(StochasticTransformParam, transform_estimator_hidden, scale_bias=self.transform_var_bias)
+
+        # def _make_transform_estimator(x):
+        #     est = StochasticTransformParam(transform_estimator_hidden, x, scale_bias=self.transform_var_bias)
+        #     return est
 
         super(AIRonMNIST, self).__init__(
             *args,
@@ -33,9 +40,9 @@ class AIRonMNIST(AIRModel):
             transition=snt.LSTM(256),
             input_encoder=(lambda: Encoder(inpt_encoder_hidden)),
             glimpse_encoder=(lambda: Encoder(glimpse_encoder_hidden)),
-            glimpse_decoder=(lambda x: Decoder(glimpse_decoder_hidden, x)),
-            transform_estimator=_make_transform_estimator,
-            steps_predictor=(lambda: StepsPredictor(steps_pred_hidden, step_bias)),
+            glimpse_decoder=partial(Decoder, glimpse_decoder_hidden),
+            transform_estimator=transform_estimator,
+            steps_predictor=(lambda: StepsPredictor(steps_pred_hidden, self.step_bias)),
             output_std=.3,
             **kwargs
         )
